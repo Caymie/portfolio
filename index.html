@@ -1,404 +1,5 @@
 <!DOCTYPE html>
 <html lang="en"><head>
-    <script>
-      (function() {
-        // Capture host references before any artifact code runs: Window.parent
-        // is [Replaceable] (a top-level `var parent` in artifact code would
-        // replace the accessor with a data property), and a top-level
-        // `const crypto` would shadow the global — either would otherwise
-        // silently break the bridge for artifacts that worked before.
-        const realParent = window.parent;
-        const cryptoObj = window.crypto;
-        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
-        // parser-blocking tag. Native fetch, captured before the proxy override below.
-        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
-        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
-        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
-        let htmlToImageLoad = null;
-        const loadHtmlToImage = () => {
-          if (!htmlToImageLoad) {
-            htmlToImageLoad = (realFetch
-              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
-              : Promise.reject(new Error('fetch unavailable'))
-            )
-              .then((res) => {
-                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
-                return res.text();
-              })
-              .then((source) => {
-                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
-                // window-global branch; inline script text runs synchronously on insert.
-                const hidden = ['define', 'module', 'exports'].map((k) => {
-                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
-                  try { window[k] = undefined; } catch (e) {}
-                  return entry;
-                });
-                try {
-                  const el = document.createElement('script');
-                  el.text = source;
-                  (document.head || document.documentElement).appendChild(el);
-                } finally {
-                  hidden.forEach(({ k, own, v }) => {
-                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
-                  });
-                }
-                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
-                return window.htmlToImage;
-              });
-            // A failed load may be transient; let the next screenshot retry.
-            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
-          }
-          return htmlToImageLoad;
-        };
-        // crypto.randomUUID exists only in Secure Contexts; fall back to a
-        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
-        // uniqueness is what the bridge needs, unpredictability is
-        // defense-in-depth on top of the source guards.
-        const newRequestId =
-          cryptoObj && typeof cryptoObj.randomUUID === "function"
-            ? function () { return cryptoObj.randomUUID(); }
-            : function () { return Date.now() + "-" + Math.random(); };
-        const originalConsole = window.console;
-        window.console = {
-          log: (...args) => {
-            originalConsole.log(...args);
-            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
-          },
-          error: (...args) => {
-            originalConsole.error(...args);
-            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
-          },
-          warn: (...args) => {
-            originalConsole.warn(...args);
-            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
-          }
-        };
-
-        // Bridge request ids are crypto-random (not sequential) so they
-        // cannot be predicted by other frames in the tab.
-        let callbacksMap = new Map();
-        let streamControllers = new Map();
-        
-        window.claude = {
-          complete: (prompt) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
-            });
-          }
-        };
-
-        window.storage = {
-          get: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
-            });
-          },
-          set: (key, value, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
-            });
-          },
-          delete: (key, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
-            });
-          },
-          list: (prefix, shared = false) => {
-            return new Promise((resolve, reject) => {
-              const id = newRequestId();
-              callbacksMap.set(id, { resolve, reject });
-              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
-            });
-          }
-        };
-
-        let pendingBlobs = new Map();
-        URL.createObjectURL = (blob) => {
-          // Store the blob and create an ID and URL for it
-          const blobId = `blob-${Date.now()}-${Math.random()}`;
-          pendingBlobs.set(blobId, blob);
-          return `blob-request://${blobId}`;
-        };
-
-        URL.revokeObjectURL = (url) => {
-          // Remove the blob from our store
-          const blobId = url.replace("blob-request://", "");
-          pendingBlobs.delete(blobId);
-        };
-
-        const getBlobFromURL = (url) => {
-          const blobId = url.replace("blob-request://", "");
-          return pendingBlobs.get(blobId);
-        };
-
-        // Override global fetch with streaming support
-        window.fetch = (url, init = {}) => {
-          return new Promise((resolve, reject) => {
-            const id = newRequestId();
-            const channelId = `fetch-${id}-${Date.now()}`;
-            
-            callbacksMap.set(id, { 
-              resolve: (response) => {
-                // Null-body statuses: Response(stream, {status: 204}) throws
-                // per the Fetch spec, which would escape this resolver and
-                // hang the artifact's await forever.
-                if (response.status === 204 || response.status === 205 || response.status === 304) {
-                  try {
-                    resolve(new Response(null, {
-                      status: response.status,
-                      statusText: response.statusText,
-                      headers: response.headers
-                    }));
-                  } catch (err) {
-                    // Invalid statusText/header bytes can throw here too.
-                    reject(new TypeError(
-                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
-                    ));
-                  }
-                  return;
-                }
-                // Create a ReadableStream for the response body
-                const stream = new ReadableStream({
-                  start(controller) {
-                    streamControllers.set(channelId, controller);
-                  },
-                  cancel() {
-                    streamControllers.delete(channelId);
-                  }
-                });
-                
-                // Create and return the Response with the stream. Response()
-                // requires status in [200, 599]; an opaque/no-cors fetch
-                // forwards status 0, which would throw here and escape the
-                // resolver, hanging the artifact's await. Surface it as a
-                // network-error-shaped rejection instead.
-                try {
-                  resolve(new Response(stream, {
-                    status: response.status,
-                    statusText: response.statusText,
-                    headers: response.headers
-                  }));
-                } catch (err) {
-                  streamControllers.delete(channelId);
-                  reject(new TypeError(
-                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
-                  ));
-                }
-              },
-              reject,
-              channelId
-            });
-            
-            realParent.postMessage({
-              type: 'proxyFetch',
-              id,
-              url,
-              init,
-              channelId
-            }, '*');
-          });
-        };
-
-        window.addEventListener('message', async (event) => {
-          // Only the embedding parent may drive the bridge — sibling and
-          // nested frames can also postMessage into this window.
-          if (event.source !== realParent) return;
-          if (event.data.type === 'takeScreenshot') {
-            // Echo the request's nonce so the requester can correlate the
-            // reply to ITS request — a reply without the expected nonce
-            // (e.g. from a stale pre-remount artifact) is ignored upstream.
-            const screenshotNonce = event.data.nonce;
-            const rootElement = document.getElementById('artifacts-component-root-html');
-            if (!rootElement) {
-              realParent.postMessage({
-                type: 'screenshotError',
-                nonce: screenshotNonce,
-                error: new Error('Root element not found'),
-              }, '*');
-              return;
-            }
-            // Catch CDN load failures and toPng errors so the parent always
-            // gets a response instead of hanging forever.
-            try {
-              const htmlToImage = await loadHtmlToImage();
-              const screenshot = await htmlToImage.toPng(rootElement, {
-                imagePlaceholder:
-                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
-              });
-              realParent.postMessage({
-                type: 'screenshotData',
-                nonce: screenshotNonce,
-                data: screenshot,
-              }, '*');
-            } catch (err) {
-              realParent.postMessage({
-                type: 'screenshotError',
-                nonce: screenshotNonce,
-                error: err instanceof Error ? err : new Error(String(err)),
-              }, '*');
-            }
-          } else if (event.data.type === 'claudeComplete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.completion);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'proxyFetchResponse') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-              callbacksMap.delete(event.data.id);
-            } else {
-              // Initial response with headers, status, etc.
-              callback.resolve({
-                status: event.data.status,
-                statusText: event.data.statusText,
-                headers: event.data.headers
-              });
-              // Don't delete the callback yet if streaming
-              if (!event.data.body) {
-                callbacksMap.delete(event.data.id);
-              }
-            }
-          } else if (event.data.type === 'proxyFetchStream') {
-            // Handle streaming data chunks
-            const controller = streamControllers.get(event.data.channelId);
-            if (controller) {
-              if (event.data.error) {
-                controller.error(new Error(event.data.error));
-                streamControllers.delete(event.data.channelId);
-              } else if (event.data.done) {
-                controller.close();
-                streamControllers.delete(event.data.channelId);
-                // Clean up the callback
-                const callback = Array.from(callbacksMap.entries()).find(
-                  ([_, value]) => value.channelId === event.data.channelId
-                );
-                if (callback) {
-                  callbacksMap.delete(callback[0]);
-                }
-              } else if (event.data.chunk) {
-                controller.enqueue(new Uint8Array(event.data.chunk));
-              }
-            }
-          } else if (event.data.type === 'storageGet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageSet') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageDelete') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          } else if (event.data.type === 'storageList') {
-            const callback = callbacksMap.get(event.data.id);
-            if (!callback) return;
-            if (event.data.error) {
-              callback.reject(new Error(event.data.error));
-            } else {
-              callback.resolve(event.data.result);
-            }
-            callbacksMap.delete(event.data.id);
-          }
-        });
-
-        window.addEventListener('click', (event) => {
-          const isEl = event.target instanceof HTMLElement;
-          if (!isEl) return;
-    
-          // find ancestor links
-          const linkEl = event.target.closest("a");
-          if (!linkEl || !linkEl.href) return;
-    
-          event.preventDefault();
-          event.stopImmediatePropagation();
-    
-          if (linkEl.href.startsWith("blob-request:")) {
-            const blob = getBlobFromURL(linkEl.href);
-            if (!blob) return;
-            void blob.arrayBuffer().then((data) => {
-              realParent.postMessage({
-                type: "downloadFile",
-                filename: linkEl.download,
-                data,
-                mimeType: blob.type || "application/octet-stream",
-              });
-            });
-          } else if (linkEl.href.startsWith("data:")) {
-            const [header, base64Data] = linkEl.href.split(",");
-            const mimeMatch = header.match(/data:([^;]+)/);
-            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
-            const binaryString = atob(base64Data);
-            const data = Uint8Array.from(binaryString, (c) =>
-              c.charCodeAt(0),
-            ).buffer;
-            realParent.postMessage({
-              type: "downloadFile",
-              filename: linkEl.download,
-              data,
-              mimeType,
-            });
-          } else {
-            let linkUrl;
-            try {
-              linkUrl = new URL(linkEl.href);
-            } catch (error) {
-              return;
-            }
-    
-            if (linkUrl.hostname === window.location.hostname) return;
-      
-            realParent.postMessage({
-              type: 'openExternal',
-              href: linkEl.href,
-            }, '*');
-          }
-      });
-
-        const originalOpen = window.open;
-        window.open = function (url) {
-          realParent.postMessage({
-            type: "openExternal",
-            href: url,
-          }, "*");
-        };
-
-        window.addEventListener('error', (event) => {
-          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
-        });
-      })();
-    </script>
-  
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Charles Aymie — Portfolio</title>
@@ -426,22 +27,6 @@ body{
 .wrap{max-width:1080px; margin:0 auto; padding:0 28px;}
 a{color:var(--ink);}
 img{max-width:100%; display:block;}
-
-/* editable affordance */
-[contenteditable="true"]{
-  border-radius:3px; transition:background 0.15s;
-}
-[contenteditable="true"]:hover{
-  background:var(--accent-soft);
-  outline:1px dashed var(--accent);
-  outline-offset:2px;
-  cursor:text;
-}
-[contenteditable="true"]:focus{
-  background:#fff;
-  outline:2px solid var(--accent);
-  outline-offset:2px;
-}
 
 /* nav */
 header.nav{
@@ -596,11 +181,11 @@ footer{padding:40px 0 90px; text-align:center; color:var(--ink-soft); font-famil
 }
 </style>
 </head>
-<body id="artifacts-component-root-html">
+<body>
 
 <header class="nav">
   <div class="nav-inner">
-    <div class="brand" contenteditable="true">Charles <span>Aymie</span></div>
+    <div class="brand">Charles <span>Aymie</span></div>
     <nav class="nav-links">
       <a href="#work">Work</a>
       <a href="#experience">Experience</a>
@@ -611,25 +196,25 @@ footer{padding:40px 0 90px; text-align:center; color:var(--ink-soft); font-famil
 
 <section class="hero">
   <div class="wrap">
-    <span class="eyebrow" contenteditable="true">Mechanical Engineering · UMass Amherst · Class of 2027</span>
-    <h1 contenteditable="true">Charles Aymie</h1>
-    <p class="lede" contenteditable="true">Mechanical engineering student with manufacturing and controls internship experience. Currently open to full-time roles in manufacturing, robotics, design, and controls.</p>
+    <span class="eyebrow">Mechanical Engineering · UMass Amherst · Class of 2027</span>
+    <h1>Charles Aymie</h1>
+    <p class="lede">Mechanical engineering student with manufacturing and controls internship experience. Currently open to full-time roles in manufacturing, robotics, design, and controls.</p>
     <div class="contact-row">
-      <a href="mailto:charlieaymie@gmail.com" contenteditable="true">charlieaymie@gmail.com</a>
+      <a href="mailto:charlieaymie@gmail.com">charlieaymie@gmail.com</a>
       <span class="sep">/</span>
-      <a href="tel:5089488815" contenteditable="true">508-948-8815</a>
+      <a href="tel:5089488815">508-948-8815</a>
       <span class="sep">/</span>
-      <a href="https://www.linkedin.com/in/charlieaymie/" target="_blank" rel="noopener" contenteditable="true">LinkedIn</a>
+      <a href="https://www.linkedin.com/in/charlieaymie/" target="_blank" rel="noopener">LinkedIn</a>
       <span class="sep">/</span>
-      <span contenteditable="true">Northborough, MA</span>
+      <span>Northborough, MA</span>
     </div>
   </div>
 </section>
 
 <section class="sec" id="work">
   <div class="wrap">
-    <div class="sec-head"><span class="num">01</span><h2 contenteditable="true">Selected Work</h2></div>
-    <p class="sec-sub" contenteditable="true">A few things I've designed, printed, and put together — click any photo for more.</p>
+    <div class="sec-head"><span class="num">01</span><h2>Selected Work</h2></div>
+    <p class="sec-sub">A few things I've designed, printed, and put together — click any photo for more.</p>
 
     <div class="proj-list">
 
@@ -640,9 +225,9 @@ footer{padding:40px 0 90px; text-align:center; color:var(--ink-soft); font-famil
           <div class="count">▣ 3 photos</div>
         </div>
         <div class="proj-body">
-          <h3 contenteditable="true">Mechatronics Excavation Rover</h3>
-          <p contenteditable="true">Designed and manufactured for the ASME IAM3D R.O.V.E.R. Design Team: a competition rover with a multi-joint excavator arm, built using CAD, additive manufacturing, rapid prototyping, and iterative design to compete in an obstacle-course resource-excavation challenge.</p>
-          <div class="proj-tags"><span contenteditable="true">CAD</span><span contenteditable="true">3D Printing</span><span contenteditable="true">Mechatronics</span><span contenteditable="true">Team Project</span></div>
+          <h3>Mechatronics Excavation Rover</h3>
+          <p>Designed and manufactured for the ASME IAM3D R.O.V.E.R. Design Team: a competition rover with a multi-joint excavator arm, built using CAD, additive manufacturing, rapid prototyping, and iterative design to compete in an obstacle-course resource-excavation challenge.</p>
+          <div class="proj-tags"><span>CAD</span><span>3D Printing</span><span>Mechatronics</span><span>Team Project</span></div>
         </div>
       </div>
 
@@ -653,9 +238,9 @@ footer{padding:40px 0 90px; text-align:center; color:var(--ink-soft); font-famil
           <div class="count">▣ 5 items</div>
         </div>
         <div class="proj-body">
-          <h3 contenteditable="true">Animatronic Eye Mechanism</h3>
-          <p contenteditable="true">Worked with a team of engineers to produce the parts for and code a functional animatronic eye — 3D-printed linkage parts, soldered and wired the drive electronics, and coded motor control for smooth, lifelike motion.</p>
-          <div class="proj-tags"><span contenteditable="true">3D Printing</span><span contenteditable="true">Electronics</span><span contenteditable="true">Motion Control</span></div>
+          <h3>Animatronic Eye Mechanism</h3>
+          <p>Worked with a team of engineers to produce the parts for and code a functional animatronic eye — 3D-printed linkage parts, soldered and wired the drive electronics, and coded motor control for smooth, lifelike motion.</p>
+          <div class="proj-tags"><span>3D Printing</span><span>Electronics</span><span>Motion Control</span></div>
         </div>
       </div>
 
@@ -666,9 +251,9 @@ footer{padding:40px 0 90px; text-align:center; color:var(--ink-soft); font-famil
           <div class="count">▣ 1 photo</div>
         </div>
         <div class="proj-body">
-          <h3 contenteditable="true">Custom Servo Motor</h3>
-          <p contenteditable="true">Designed and assembled a functional servo motor prototype from scratch — gear train analysis and CAD in Fusion 360, additive manufacturing for the gear train and enclosure, and full electronics integration.</p>
-          <div class="proj-tags"><span contenteditable="true">Fusion 360</span><span contenteditable="true">Gear Design</span><span contenteditable="true">Additive Mfg.</span></div>
+          <h3>Custom Servo Motor</h3>
+          <p>Designed and assembled a functional servo motor prototype from scratch — gear train analysis and CAD in Fusion 360, additive manufacturing for the gear train and enclosure, and full electronics integration.</p>
+          <div class="proj-tags"><span>Fusion 360</span><span>Gear Design</span><span>Additive Mfg.</span></div>
         </div>
       </div>
 
@@ -679,9 +264,9 @@ footer{padding:40px 0 90px; text-align:center; color:var(--ink-soft); font-famil
           <div class="count">▣ 1 photo</div>
         </div>
         <div class="proj-body">
-          <h3 contenteditable="true">PCB Mounting Assembly</h3>
-          <p contenteditable="true">Designed and manufactured a DFMA-optimized PCB mounting assembly — parts built by machining, sheet metal fabrication, and fixturing, assembled using robotic assembly with a UR5e to maximize supply-chain and manufacturing efficiency.</p>
-          <div class="proj-tags"><span contenteditable="true">DFMA</span><span contenteditable="true">UR5e</span><span contenteditable="true">Automated Assembly</span></div>
+          <h3>PCB Mounting Assembly</h3>
+          <p>Designed and manufactured a DFMA-optimized PCB mounting assembly — parts built by machining, sheet metal fabrication, and fixturing, assembled using robotic assembly with a UR5e to maximize supply-chain and manufacturing efficiency.</p>
+          <div class="proj-tags"><span>DFMA</span><span>UR5e</span><span>Automated Assembly</span></div>
         </div>
       </div>
 
@@ -691,74 +276,74 @@ footer{padding:40px 0 90px; text-align:center; color:var(--ink-soft); font-famil
 
 <section class="sec panel" id="experience">
   <div class="wrap">
-    <div class="sec-head"><span class="num">02</span><h2 contenteditable="true">Experience</h2></div>
-    <p class="sec-sub" contenteditable="true">Internships and hands-on work, most recent first.</p>
+    <div class="sec-head"><span class="num">02</span><h2>Experience</h2></div>
+    <p class="sec-sub">Internships and hands-on work, most recent first.</p>
     <div class="timeline">
       <div class="tl-item">
-        <div class="meta" contenteditable="true">June 2026 — Aug 2026</div>
+        <div class="meta">June 2026 — Aug 2026</div>
         <div>
-          <h3 contenteditable="true">Manufacturing Engineering Intern</h3>
-          <div class="org" contenteditable="true">Thermo Fisher Scientific, Inc., Bedford, MA</div>
+          <h3>Manufacturing Engineering Intern</h3>
+          <div class="org">Thermo Fisher Scientific, Inc., Bedford, MA</div>
           <ul>
-            <li contenteditable="true">Supported validation activities that extended manufacturing equipment clean hold time by 195% through vessel sampling, lab testing, data analysis, and technical documentation</li>
-            <li contenteditable="true">Applied statistical process control (SPC), root cause analysis, and process improvement methods to reduce sonication passes during manufacturing</li>
-            <li contenteditable="true">Performed engineering data analysis to assess laboratory instrument equivalency using regression analysis, correlation (R²), bias, and standard deviation, informing crossover validation recommendations</li>
-            <li contenteditable="true">Contributed to manufacturing equipment improvement projects — dryer modifications, elutriation recirculation cart development, validation execution, and engineering change control documentation</li>
+            <li>Supported validation activities that extended manufacturing equipment clean hold time by 195% through vessel sampling, lab testing, data analysis, and technical documentation</li>
+            <li>Applied statistical process control (SPC), root cause analysis, and process improvement methods to reduce sonication passes during manufacturing</li>
+            <li>Performed engineering data analysis to assess laboratory instrument equivalency using regression analysis, correlation (R²), bias, and standard deviation, informing crossover validation recommendations</li>
+            <li>Contributed to manufacturing equipment improvement projects — dryer modifications, elutriation recirculation cart development, validation execution, and engineering change control documentation</li>
           </ul>
         </div>
       </div>
       <div class="tl-item">
-        <div class="meta" contenteditable="true">May 2025 — Aug 2025</div>
+        <div class="meta">May 2025 — Aug 2025</div>
         <div>
-          <h3 contenteditable="true">Mechanical Engineering Intern</h3>
-          <div class="org" contenteditable="true">Automated Logic — A Carrier Company, Chicopee, MA</div>
+          <h3>Mechanical Engineering Intern</h3>
+          <div class="org">Automated Logic — A Carrier Company, Chicopee, MA</div>
           <ul>
-            <li contenteditable="true">Corrected 250+ engineering drawing errors on the UMass Sustainable Engineering Laboratory project, preventing misordered parts and saving an estimated $150,000+</li>
-            <li contenteditable="true">Calibrated and commissioned 50+ automated control system assemblies at Baystate Medical using multimeters, network terminals, and diagnostic tools</li>
-            <li contenteditable="true">Installed and repaired 50+ control modules for the $200M Smith College Geothermal project</li>
-            <li contenteditable="true">Designed and commissioned control sequences in WebCTRL for standalone and networked systems</li>
+            <li>Corrected 250+ engineering drawing errors on the UMass Sustainable Engineering Laboratory project, preventing misordered parts and saving an estimated $150,000+</li>
+            <li>Calibrated and commissioned 50+ automated control system assemblies at Baystate Medical using multimeters, network terminals, and diagnostic tools</li>
+            <li>Installed and repaired 50+ control modules for the $200M Smith College Geothermal project</li>
+            <li>Designed and commissioned control sequences in WebCTRL for standalone and networked systems</li>
           </ul>
         </div>
       </div>
       <div class="tl-item">
-        <div class="meta" contenteditable="true">January 2025</div>
+        <div class="meta">January 2025</div>
         <div>
-          <h3 contenteditable="true">Field Engineer &amp; Technician Intern</h3>
-          <div class="org" contenteditable="true">Sebago Fiber, Sebago, ME</div>
+          <h3>Field Engineer &amp; Technician Intern</h3>
+          <div class="org">Sebago Fiber, Sebago, ME</div>
           <ul>
-            <li contenteditable="true">Installed fiber optic network systems into residential and commercial sites</li>
-            <li contenteditable="true">Wired and assembled systems following safety standards and customer specifications</li>
+            <li>Installed fiber optic network systems into residential and commercial sites</li>
+            <li>Wired and assembled systems following safety standards and customer specifications</li>
           </ul>
         </div>
       </div>
       <div class="tl-item">
-        <div class="meta" contenteditable="true">Jan 2021 — Jan 2023</div>
+        <div class="meta">Jan 2021 — Jan 2023</div>
         <div>
-          <h3 contenteditable="true">Owner</h3>
-          <div class="org" contenteditable="true">Local 3D Printing Business</div>
+          <h3>Owner</h3>
+          <div class="org">Local 3D Printing Business</div>
           <ul>
-            <li contenteditable="true">Operated and maintained a fleet of 3D printers to design, print, and sell parts and figures</li>
-            <li contenteditable="true">Used CAD/CAM to convert a standard motor into a custom servo motor</li>
-            <li contenteditable="true">Managed a working budget while learning CAD from the ground up</li>
+            <li>Operated and maintained a fleet of 3D printers to design, print, and sell parts and figures</li>
+            <li>Used CAD/CAM to convert a standard motor into a custom servo motor</li>
+            <li>Managed a working budget while learning CAD from the ground up</li>
           </ul>
         </div>
       </div>
     </div>
 
     <div style="margin-top:48px;">
-      <div class="sec-head" style="margin-bottom:20px;"><span class="num">03</span><h2 contenteditable="true">Education &amp; Skills</h2></div>
-      <p style="font-size:15px;" contenteditable="true"><strong>B.S. Mechanical Engineering</strong> — University of Massachusetts Amherst · GPA 3.96/4.0 · Expected May 2027</p>
-      <p style="font-size:14px; color:var(--ink-soft);" contenteditable="true">Coursework: Statics, Dynamics, Strength of Materials, Material Science, Thermodynamics, Fluid Mechanics, Electrical Engineering, Manufacturing, Statistics, Heat Transfer, Design Concepts, CompSci 119</p>
+      <div class="sec-head" style="margin-bottom:20px;"><span class="num">03</span><h2>Education &amp; Skills</h2></div>
+      <p style="font-size:15px;"><strong>B.S. Mechanical Engineering</strong> — University of Massachusetts Amherst · GPA 3.96/4.0 · Expected May 2027</p>
+      <p style="font-size:14px; color:var(--ink-soft);">Coursework: Statics, Dynamics, Strength of Materials, Material Science, Thermodynamics, Fluid Mechanics, Electrical Engineering, Manufacturing, Statistics, Heat Transfer, Design Concepts, CompSci 119</p>
       <div class="chips">
-        <span class="chip" contenteditable="true">SolidWorks</span>
-        <span class="chip" contenteditable="true">Fusion 360</span>
-        <span class="chip" contenteditable="true">GD&amp;T</span>
-        <span class="chip" contenteditable="true">FEA / Ansys</span>
-        <span class="chip" contenteditable="true">MATLAB</span>
-        <span class="chip" contenteditable="true">Python</span>
-        <span class="chip" contenteditable="true">3D Printing</span>
-        <span class="chip" contenteditable="true">Shop Machinery</span>
-        <span class="chip" contenteditable="true">OSHA Certified</span>
+        <span class="chip">SolidWorks</span>
+        <span class="chip">Fusion 360</span>
+        <span class="chip">GD&amp;T</span>
+        <span class="chip">FEA / Ansys</span>
+        <span class="chip">MATLAB</span>
+        <span class="chip">Python</span>
+        <span class="chip">3D Printing</span>
+        <span class="chip">Shop Machinery</span>
+        <span class="chip">OSHA Certified</span>
       </div>
     </div>
   </div>
@@ -766,19 +351,19 @@ footer{padding:40px 0 90px; text-align:center; color:var(--ink-soft); font-famil
 
 <section class="sec" id="contact">
   <div class="wrap">
-    <div class="sec-head"><span class="num">04</span><h2 contenteditable="true">Contact</h2></div>
+    <div class="sec-head"><span class="num">04</span><h2>Contact</h2></div>
     <div class="contact-grid">
-      <div class="c-cell"><div class="label">Email</div><div class="val"><a href="mailto:charlieaymie@gmail.com" contenteditable="true">charlieaymie@gmail.com</a></div></div>
-      <div class="c-cell"><div class="label">Phone</div><div class="val"><a href="tel:5089488815" contenteditable="true">508-948-8815</a></div></div>
-      <div class="c-cell"><div class="label">LinkedIn</div><div class="val"><a href="https://www.linkedin.com/in/charlieaymie/" target="_blank" rel="noopener" contenteditable="true">/charlieaymie</a></div></div>
-      <div class="c-cell"><div class="label">Location</div><div class="val" contenteditable="true">Northborough, MA</div></div>
-      <div class="c-cell"><div class="label">Education</div><div class="val" contenteditable="true">UMass Amherst, B.S. ME</div></div>
-      <div class="c-cell"><div class="label">Graduation</div><div class="val" contenteditable="true">May 2027</div></div>
+      <div class="c-cell"><div class="label">Email</div><div class="val"><a href="mailto:charlieaymie@gmail.com">charlieaymie@gmail.com</a></div></div>
+      <div class="c-cell"><div class="label">Phone</div><div class="val"><a href="tel:5089488815">508-948-8815</a></div></div>
+      <div class="c-cell"><div class="label">LinkedIn</div><div class="val"><a href="https://www.linkedin.com/in/charlieaymie/" target="_blank" rel="noopener">/charlieaymie</a></div></div>
+      <div class="c-cell"><div class="label">Location</div><div class="val">Northborough, MA</div></div>
+      <div class="c-cell"><div class="label">Education</div><div class="val">UMass Amherst, B.S. ME</div></div>
+      <div class="c-cell"><div class="label">Graduation</div><div class="val">May 2027</div></div>
     </div>
   </div>
 </section>
 
-<footer contenteditable="true">© Charles Aymie — built with care</footer>
+<footer>© Charles Aymie — built with care</footer>
 
 <!-- lightbox -->
 <div class="lightbox" id="lightbox">
